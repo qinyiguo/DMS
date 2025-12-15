@@ -544,40 +544,44 @@ def get_home():
                 }
             }
             
-            async function uploadFile(input, endpoint) {
-                if (!input.files[0]) return;
-                
-                const file = input.files[0];
-                const formData = new FormData();
-                formData.append('file', file);
-                
-                const prefix = endpoint.split('-')[0];
-                const progressDiv = document.getElementById(`progress-${prefix}`);
-                const messageDiv = document.getElementById(`message-${prefix}`);
-                
-                progressDiv.style.display = 'block';
-                messageDiv.innerHTML = '';
-                
-                try {
-                    const response = await fetch(`/upload/${endpoint}`, {
-                        method: 'POST',
-                        body: formData
-                    });
-                    
-                    const data = await response.json();
-                    
-                    if (data.status === 'success') {
-                        messageDiv.innerHTML = `<div class="message success">✓ ${data.message}</div>`;
-                        input.value = '';
-                    } else {
-                        messageDiv.innerHTML = `<div class="message error">✗ ${data.message}</div>`;
-                    }
-                } catch (error) {
-                    messageDiv.innerHTML = `<div class="message error">✗ 上傳失敗: ${error.message}</div>`;
-                }
-                
-                progressDiv.style.display = 'none';
-            }
+async function uploadFile(input, endpoint) {
+    if (!input.files[0]) return;
+    
+    const file = input.files[0];
+    const formData = new FormData();
+    formData.append('file', file);
+    
+    const prefix = endpoint.split('-')[0];
+    const progressDiv = document.getElementById(`progress-${prefix}`);
+    const messageDiv = document.getElementById(`message-${prefix}`);
+    
+    progressDiv.style.display = 'block';
+    messageDiv.innerHTML = '';
+    
+    try {
+        const response = await fetch(`/upload/${endpoint}`, {
+            method: 'POST',
+            body: formData
+        });
+        
+        const data = await response.json();
+        
+        if (data.status === 'success') {
+            messageDiv.innerHTML = `<div class="message success">✓ ${data.message}</div>`;
+            input.value = '';
+        } else if (data.status === 'warning') {
+            messageDiv.innerHTML = `<div class="message success">⚠️ ${data.message}</div>`;
+        } else {
+            messageDiv.innerHTML = `<div class="message error">✗ ${data.message || '上傳失敗'}</div>`;
+        }
+    } catch (error) {
+        console.error('Upload error:', error);
+        messageDiv.innerHTML = `<div class="message error">✗ 上傳失敗: ${error.message}</div>`;
+    }
+    
+    progressDiv.style.display = 'none';
+}
+
             
             async function loadTableData() {
                 const tableName = document.getElementById('table-select').value;
