@@ -90,48 +90,17 @@ init_db()
 
 # ==================== 上傳 Excel 的 API ====================
 
-@app.post("/upload/provincial-operations")
-async def upload_provincial_operations(file: UploadFile = File(...), allow_duplicate: bool = Query(False)):
-    """上傳全省營運數據"""
-    return await upload_excel(file, "provincial_operations", allow_duplicate)
-
-@app.post("/upload/parts-sales")
-async def upload_parts_sales(file: UploadFile = File(...), allow_duplicate: bool = Query(False)):
-    """上傳零件銷售資料"""
-    return await upload_excel(file, "parts_sales", allow_duplicate)
-
-@app.post("/upload/repair-income")
-async def upload_repair_income(file: UploadFile = File(...), allow_duplicate: bool = Query(False)):
-    """上傳維修收入明細"""
-    return await upload_excel(file, "repair_income_details", allow_duplicate)
-
-@app.post("/upload/technician-performance")
-async def upload_technician_performance(file: UploadFile = File(...), allow_duplicate: bool = Query(False)):
-    """上傳技師績效"""
-    return await upload_excel(file, "technician_performance", allow_duplicate)
-
-@app.post("/upload/kpi_targets")
-async def upload_kpi_targets(file: UploadFile = File(...), allow_duplicate: bool = Query(False)):
-    """上傳 KPI 目標資料"""
-    return await upload_excel(file, "kpi_targets", allow_duplicate)
-
 async def upload_excel(file: UploadFile, table_name: str, allow_duplicate: bool = False):
-    """通用 Excel 上傳函數"""
+    """
+    智能 Excel 上傳函數
+    - 自動檢測重複資料
+    - 重複的資料會被更新（覆蓋）
+    - 新資料會被新增
+    """
     try:
         # 讀取文件內容
         file_content = await file.read()
         file_hash = calculate_file_hash(file_content)
-        
-        # 檢查文件是否已上傳
-        existing_file = check_file_exists(table_name, file_hash)
-        if existing_file and not allow_duplicate:
-            return {
-                "status": "warning",
-                "message": f"此文件已於 {existing_file['created_at']} 上傳過",
-                "table": table_name,
-                "existing_file": existing_file['file_name'],
-                "hint": "如要重新上傳，請添加參數 ?allow_duplicate=true"
-            }
         
         # 讀取 Excel
         df = pd.read_excel(file_content, engine='openpyxl')
@@ -140,37 +109,174 @@ async def upload_excel(file: UploadFile, table_name: str, allow_duplicate: bool 
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # 逐行匯入
-        inserted_count = 0
-        for index, row in df.iterrows():
-            # 將 NaN 轉換為 None
-            data_dict = row.where(pd.notna(row), None).to_dict()
+        # 定義每個表的唯一性判斷欄位（關鍵欄位組合）
+        unique_keys = {
+            "parts_sales": ["日期", "銷售人員", "零件編號", "廠別"],  # 零件銷售
+            "repair_income_details": ["日期", "技師", "工單號"],      # 維修收入
+            "technician_performance": ["日期", "技師姓名"],          # 技師績效
+            "provincial_operations": ["日期", "省份"],               # 省級營運
+            "kpi_targets": ["年份", "月份", "銷售人員", "廠別"]      # KPI 目標
+        }
+        
+        # 取得該表的唯一性欄位
+        table_unique_keys = unique_keys.get(table_name, [])
+        
+        # 統計資訊
+        inserted_count = 0   # 新增筆數
+        updated_count = 0    # 更新筆數
+        skipped_count = 0    # 跳過筆數
+        error_rows = []      # 錯誤的行
+        
+        # 如果沒有定義唯一性欄位，則使用簡單插入模式
+        if not table_unique_keys:
+            for index, row in df.iterrows():
+                try:
+                    data_dict = row.where(pd.notna(row), None).to_dict()
+                    
+                    cursor.execute(
+                        f"INSERT INTO {table_name} (file_name, row_number, data, file_hash) VALUES (?, ?, ?, ?)",
+                        (file.filename, index + 1, json.dumps(data_dict, ensure_ascii=False, default=str), file_hash)
+                    )
+                    inserted_count += 1
+                except Exception as e:
+                    error_rows.append({"row": index + 1, "error": str(e)})
+        else:
+            # 使用智能去重模式
+            # 先載入現有資料到記憶體中（用於比對）
+            cursor.execute(f"SELECT id, data FROM {table_name}")
+            existing_records = cursor.fetchall()
             
-            cursor.execute(
-                f"INSERT INTO {table_name} (file_name, row_number, data, file_hash) VALUES (?, ?, ?, ?)",
-                (file.filename, index + 1, json.dumps(data_dict, ensure_ascii=False, default=str), file_hash)
-            )
-            inserted_count += 1
+            # 建立現有資料的索引（用唯一鍵組合作為 key）
+            existing_data_map = {}
+            for record in existing_records:
+                data = json.loads(record["data"])
+                
+                # 生成唯一鍵
+                unique_key_values = []
+                for key in table_unique_keys:
+                    value = data.get(key)
+                    if value is not None:
+                        # 統一處理日期格式
+                        if "日期" in key:
+                            try:
+                                value = pd.to_datetime(value).strftime("%Y-%m-%d")
+                            except:
+                                pass
+                        unique_key_values.append(str(value))
+                
+                if unique_key_values:  # 只有當所有關鍵欄位都存在時才建立索引
+                    unique_key = "|".join(unique_key_values)
+                    existing_data_map[unique_key] = record["id"]
+            
+            # 逐行處理新資料
+            for index, row in df.iterrows():
+                try:
+                    data_dict = row.where(pd.notna(row), None).to_dict()
+                    
+                    # 生成新資料的唯一鍵
+                    unique_key_values = []
+                    missing_keys = []
+                    
+                    for key in table_unique_keys:
+                        value = data_dict.get(key)
+                        if value is None or (isinstance(value, float) and pd.isna(value)):
+                            missing_keys.append(key)
+                        else:
+                            # 統一處理日期格式
+                            if "日期" in key:
+                                try:
+                                    value = pd.to_datetime(value).strftime("%Y-%m-%d")
+                                    data_dict[key] = value  # 更新為標準格式
+                                except:
+                                    pass
+                            unique_key_values.append(str(value))
+                    
+                    # 如果缺少關鍵欄位，則跳過該筆資料
+                    if missing_keys:
+                        skipped_count += 1
+                        error_rows.append({
+                            "row": index + 1,
+                            "reason": f"缺少關鍵欄位: {', '.join(missing_keys)}"
+                        })
+                        continue
+                    
+                    unique_key = "|".join(unique_key_values)
+                    
+                    # 檢查是否已存在
+                    if unique_key in existing_data_map:
+                        # 更新現有資料
+                        existing_id = existing_data_map[unique_key]
+                        cursor.execute(
+                            f"""UPDATE {table_name} 
+                                SET data = ?, 
+                                    file_name = ?, 
+                                    row_number = ?,
+                                    file_hash = ?,
+                                    updated_at = CURRENT_TIMESTAMP 
+                                WHERE id = ?""",
+                            (
+                                json.dumps(data_dict, ensure_ascii=False, default=str),
+                                file.filename,
+                                index + 1,
+                                file_hash,
+                                existing_id
+                            )
+                        )
+                        updated_count += 1
+                    else:
+                        # 新增資料
+                        cursor.execute(
+                            f"INSERT INTO {table_name} (file_name, row_number, data, file_hash) VALUES (?, ?, ?, ?)",
+                            (
+                                file.filename,
+                                index + 1,
+                                json.dumps(data_dict, ensure_ascii=False, default=str),
+                                file_hash
+                            )
+                        )
+                        inserted_count += 1
+                
+                except Exception as e:
+                    error_rows.append({"row": index + 1, "error": str(e)})
+                    skipped_count += 1
         
         conn.commit()
         cursor.close()
         conn.close()
         
+        # 組合回傳訊息
+        message_parts = []
+        if inserted_count > 0:
+            message_parts.append(f"新增 {inserted_count} 筆")
+        if updated_count > 0:
+            message_parts.append(f"更新 {updated_count} 筆")
+        if skipped_count > 0:
+            message_parts.append(f"跳過 {skipped_count} 筆")
+        
+        message = "、".join(message_parts) if message_parts else "無資料變更"
+        
         return {
             "status": "success",
-            "message": f"成功匯入 {inserted_count} 筆數據",
+            "message": f"處理完成：{message}",
             "table": table_name,
-            "rows": inserted_count,
+            "summary": {
+                "total_rows": len(df),
+                "inserted": inserted_count,
+                "updated": updated_count,
+                "skipped": skipped_count
+            },
             "filename": file.filename,
-            "file_hash": file_hash
+            "unique_keys": table_unique_keys,
+            "errors": error_rows if error_rows else None
         }
     
     except Exception as e:
         return {
             "status": "error",
-            "message": str(e),
+            "message": f"上傳失敗：{str(e)}",
             "table": table_name
         }
+
 
 # ==================== 查詢數據的 API ====================
 
